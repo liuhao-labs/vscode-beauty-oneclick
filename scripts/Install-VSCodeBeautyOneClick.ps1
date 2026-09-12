@@ -10,13 +10,17 @@ param(
     [switch]$SkipExtensions,
     [switch]$SkipFonts,
     [switch]$SkipWorkbenchCss,
-    [switch]$ForceDownload
+    [switch]$ForceDownload,
+    [string]$BackupPath = ""
 )
 
 $ErrorActionPreference = "Stop"
 $ProgressPreference = "SilentlyContinue"
 
 $VSCodeDownloadUrl = "https://update.code.visualstudio.com/latest/win32-x64-user/stable"
+$script:StepResults = New-Object 'System.Collections.Generic.List[object]'
+$script:StepWarnings = 0
+. (Join-Path $PSScriptRoot 'VSCodeBeauty.Safety.ps1')
 
 function Write-Step {
     param([string]$Message)
@@ -31,6 +35,7 @@ function Write-Ok {
 
 function Write-WarnLine {
     param([string]$Message)
+    $script:StepWarnings++
     Write-Host "[WARN] $Message" -ForegroundColor Yellow
 }
 
@@ -110,10 +115,7 @@ function Stop-VSCode {
         return
     }
 
-    Write-Step "Stopping VS Code"
-    $processes | Stop-Process -Force -ErrorAction SilentlyContinue
-    Start-Sleep -Seconds 2
-    Write-Ok "Stopped $($processes.Count) Code process(es)."
+    throw "VS Code is running. Save your work and close all VS Code windows before continuing."
 }
 
 function Assert-KnownCleanTarget {
@@ -164,8 +166,7 @@ function Clean-StandardVSCodeState {
     Write-Step "Cleaning standard VS Code state"
     Stop-VSCode
 
-    $stamp = Get-Date -Format "yyyyMMdd-HHmmss"
-    $backupRoot = Join-Path $env:USERPROFILE "Desktop\VSCode-Beauty-Backup-$stamp"
+    $backupRoot = Join-Path $script:SetupBackupRoot "cleaned"
 
     Backup-Or-RemovePath -Path (Join-Path $env:APPDATA "Code") -BackupRoot $backupRoot
     Backup-Or-RemovePath -Path (Join-Path $env:LOCALAPPDATA "Code") -BackupRoot $backupRoot
@@ -195,7 +196,7 @@ function Install-VSCode {
     }
 
     $args = "/VERYSILENT /SUPPRESSMSGBOXES /NORESTART /MERGETASKS=!runcode,addcontextmenufiles,addcontextmenufolders,addtopath"
-    $process = Start-Process -FilePath $installer -ArgumentList $args -Wait -PassThru
+    $process = Start-Process -FilePath $installer -ArgumentList $args -Wait -PassThru -WindowStyle Hidden
     if ($process.ExitCode -ne 0) {
         throw "VS Code installer failed with exit code $($process.ExitCode)."
     }
@@ -310,7 +311,7 @@ function Resolve-OptionalSourcePath {
     }
 
     $resolved = Resolve-ExistingPath -Path $Path
-    if (-not $resolved) {
+    if (-not $resolved -or -not (Test-Path -LiteralPath $resolved -PathType Container)) {
         throw "$Name does not exist: $Path"
     }
 
@@ -380,59 +381,27 @@ function Get-AutoProfileRoots {
     return $roots
 }
 
-function Get-AutoSourcePath {
-    param(
-        [ValidateSet("UserData", "Extensions")]
-        [string]$Kind
-    )
-
-    $relativePaths = if ($Kind -eq "UserData") {
-        @("user-data", "Code", "AppData\Roaming\Code")
-    }
-    else {
-        @("extensions", ".vscode\extensions")
-    }
-
-    $matches = New-Object System.Collections.Generic.List[string]
-    foreach ($root in Get-AutoProfileRoots) {
-        foreach ($relativePath in $relativePaths) {
-            $candidate = Join-Path $root $relativePath
-            Add-UniqueResolvedPath -List $matches -Path $candidate
-        }
-    }
-
-    if ($matches.Count -eq 0) {
-        return $null
-    }
-
-    if ($matches.Count -gt 1) {
-        Write-WarnLine "Multiple $Kind source candidates were found; pass -${Kind}Path explicitly."
-        foreach ($match in $matches) {
-            Write-WarnLine "  $match"
-        }
-        return $null
-    }
-
-    Write-Ok "Auto-detected ${Kind}: $($matches[0])"
-    return $matches[0]
-}
-
 function Invoke-Robocopy {
     param(
         [string]$Source,
         [string]$Destination,
-        [string[]]$ExtraArgs = @()
+        [string[]]$ExtraArgs = @(),
+        [bool]$Mirror = $true
     )
 
     if (-not (Test-Path -LiteralPath $Source)) {
         throw "Source does not exist: $Source"
     }
 
+    if (Test-PathsOverlap $Source $Destination) { throw 'Copy source and destination overlap.' }
+    Assert-NoLinkedPath -Path $Source -Recurse
+    Assert-NoLinkedPath -Path $Destination -Recurse
     New-Item -ItemType Directory -Path $Destination -Force | Out-Null
-    $args = @($Source, $Destination, "/MIR", "/R:1", "/W:1", "/NFL", "/NDL", "/NP", "/NJH", "/NJS") + $ExtraArgs
+    $copyMode = if ($Mirror) { '/MIR' } else { '/E' }
+    $args = @($Source, $Destination, $copyMode, '/XJ', "/R:1", "/W:1", "/NFL", "/NDL", "/NP", "/NJH", "/NJS") + $ExtraArgs
     & robocopy.exe @args | Out-Host
     $exit = $LASTEXITCODE
-    if ($exit -gt 7) {
+    if ($exit -lt 0 -or $exit -gt 7) {
         throw "robocopy failed with exit code $exit from '$Source' to '$Destination'."
     }
 }
@@ -445,20 +414,8 @@ function Restore-UserData {
         return
     }
 
-    $source = Resolve-OptionalSourcePath -Path $UserDataPath -Name "UserDataPath"
-    if (-not $source -and $PayloadRoot) {
-        $candidate = Join-Path $PayloadRoot "user-data"
-        if (Test-Path -LiteralPath $candidate) {
-            $source = (Resolve-Path -LiteralPath $candidate).Path
-        }
-    }
-    if (-not $source) {
-        $source = Get-AutoSourcePath -Kind "UserData"
-    }
-    if (-not $source -or -not (Test-Path -LiteralPath $source)) {
-        Write-WarnLine "No user-data source found."
-        return
-    }
+    $source = $UserDataPath
+    if (-not $source) { throw 'Validated migration source is required.' }
 
     Write-Step "Restoring VS Code user data"
     Stop-VSCode
@@ -483,22 +440,11 @@ function Restore-Extensions {
         return
     }
 
-    $source = Resolve-OptionalSourcePath -Path $ExtensionsPath -Name "ExtensionsPath"
-    if (-not $source -and $PayloadRoot) {
-        $candidate = Join-Path $PayloadRoot "extensions"
-        if (Test-Path -LiteralPath $candidate) {
-            $source = (Resolve-Path -LiteralPath $candidate).Path
-        }
-    }
-    if (-not $source) {
-        $source = Get-AutoSourcePath -Kind "Extensions"
-    }
-    if (-not $source -or -not (Test-Path -LiteralPath $source)) {
-        Write-WarnLine "No extension source found."
-        return
-    }
+    $source = $ExtensionsPath
+    if (-not $source) { throw 'Validated migration source is required.' }
 
     Write-Step "Restoring VS Code extensions"
+    Stop-VSCode
     $target = Join-Path $env:USERPROFILE ".vscode\extensions"
     Invoke-Robocopy -Source $source -Destination $target
     Write-Ok "Restored: $target"
@@ -553,7 +499,7 @@ function Configure-TodoTreeRipgrep {
         Write-Utf8NoBom -Path $settingsPath -Value "{}"
     }
 
-    $raw = Get-Content -LiteralPath $settingsPath -Raw
+    $raw = Get-Content -LiteralPath $settingsPath -Raw -Encoding UTF8
     if ([string]::IsNullOrWhiteSpace($raw)) {
         $raw = "{}"
     }
@@ -604,7 +550,9 @@ function Send-FontChangeBroadcast {
     try {
         Ensure-FontNativeMethods
         $result = [IntPtr]::Zero
-        [Win32.FontNativeMethods]::SendMessageTimeout([IntPtr]0xffff, 0x001D, [IntPtr]::Zero, [IntPtr]::Zero, 0x0002, 1000, [ref]$result) | Out-Null
+        if ([Win32.FontNativeMethods]::SendMessageTimeout([IntPtr]0xffff, 0x001D, [IntPtr]::Zero, [IntPtr]::Zero, 0x0002, 1000, [ref]$result) -eq 0) {
+            throw 'Font-change broadcast timed out or failed.'
+        }
     }
     catch {
         Write-WarnLine "Font-change broadcast failed; log off/on or restart Windows if an app cannot see font changes."
@@ -626,29 +574,16 @@ function Install-CurrentUserFonts {
         return
     }
 
-    $source = Resolve-OptionalSourcePath -Path $FontsPath -Name "FontsPath"
-    if (-not $source -and $PayloadRoot) {
-        $candidate = Join-Path $PayloadRoot "fonts"
-        if (Test-Path -LiteralPath $candidate) {
-            $source = (Resolve-Path -LiteralPath $candidate).Path
-        }
-    }
-    if (-not $source) {
-        $source = Get-RepositoryFontsRoot
-    }
-    if (-not $source -or -not (Test-Path -LiteralPath $source)) {
-        Write-WarnLine "No font source found."
-        return
-    }
+    $source = $FontsPath
+    if (-not $source) { throw 'Validated font source is required.' }
 
     Write-Step "Installing fonts for current user only"
-    Write-WarnLine "This step writes HKCU and %LOCALAPPDATA%\Microsoft\Windows\Fonts only."
+    Write-Host "This step writes HKCU and %LOCALAPPDATA%\Microsoft\Windows\Fonts only."
 
-    $fontFiles = @(Get-ChildItem -LiteralPath $source -Recurse -File -ErrorAction SilentlyContinue |
+    $fontFiles = @(Get-ChildItem -LiteralPath $source -Recurse -File -Force -ErrorAction Stop |
         Where-Object { $_.Extension -in @(".ttf", ".ttc", ".otf") })
     if ($fontFiles.Count -eq 0) {
-        Write-WarnLine "No font files found."
-        return
+        throw 'No font files found in the validated source.'
     }
 
     Ensure-FontNativeMethods
@@ -662,10 +597,18 @@ function Install-CurrentUserFonts {
     $installedCount = 0
     foreach ($font in $fontFiles) {
         $targetPath = Join-Path $target $font.Name
-        Copy-Item -LiteralPath $font.FullName -Destination $targetPath -Force
+        if (-not (Test-Path -LiteralPath $targetPath) -or
+            (Get-FileHash -LiteralPath $font.FullName).Hash -ne (Get-FileHash -LiteralPath $targetPath).Hash) {
+            Copy-Item -LiteralPath $font.FullName -Destination $targetPath -Force
+        }
         $valueName = Get-FontRegistryValueName -Font $font
         New-ItemProperty -Path $regPath -Name $valueName -Value $targetPath -PropertyType String -Force | Out-Null
-        [Win32.FontNativeMethods]::AddFontResourceW($targetPath) | Out-Null
+        $loaded = [Win32.FontNativeMethods]::AddFontResourceW($targetPath)
+        Assert-FontLoaded -Count $loaded -Path $targetPath
+        if ((Get-FileHash -LiteralPath $font.FullName).Hash -ne (Get-FileHash -LiteralPath $targetPath).Hash -or
+            (Get-ItemPropertyValue -LiteralPath $regPath -Name $valueName) -ne $targetPath) {
+            throw "Font verification failed: $targetPath"
+        }
         $installedCount++
     }
 
@@ -685,22 +628,6 @@ function Get-VSCodeWorkbenchCssPaths {
             $roots.Add($root)
         }
         $candidates.Add((Join-Path $root "resources\app\out\vs\workbench\workbench.desktop.main.css"))
-    }
-
-    $programFilesX86 = [Environment]::GetEnvironmentVariable("ProgramFiles(x86)")
-    foreach ($candidateRoot in @(
-        (Join-Path $env:LOCALAPPDATA "Programs\Microsoft VS Code"),
-        (Join-Path $env:ProgramFiles "Microsoft VS Code"),
-        $(if ($programFilesX86) { Join-Path $programFilesX86 "Microsoft VS Code" } else { $null }),
-        "D:\Microsoft VS Code",
-        "D:\VSCode-LocalClone"
-    )) {
-        if ($candidateRoot -and (Test-Path -LiteralPath $candidateRoot)) {
-            $resolvedRoot = (Resolve-Path -LiteralPath $candidateRoot).Path
-            if (-not $roots.Contains($resolvedRoot)) {
-                $roots.Add($resolvedRoot)
-            }
-        }
     }
 
     foreach ($root in $roots) {
@@ -738,16 +665,11 @@ function Patch-WorkbenchCss {
     Write-Step "Patching VS Code workbench CSS font rules"
     $cssPaths = @(Get-VSCodeWorkbenchCssPaths)
     if ($cssPaths.Count -eq 0) {
-        Write-WarnLine "No workbench.desktop.main.css was found."
-        return
+        throw 'No workbench.desktop.main.css was found.'
     }
 
     $markerStart = "/* vscode-beauty-oneclick start */"
     $markerEnd = "/* vscode-beauty-oneclick end */"
-    $oldMarkerStart = "/* vscode-beautify-auto start */"
-    $oldMarkerEnd = "/* vscode-beautify-auto end */"
-    $safeMarkerStart = "/* vscode-beauty-safe start */"
-    $safeMarkerEnd = "/* vscode-beauty-safe end */"
 
     $cssBlock = @"
 
@@ -786,32 +708,7 @@ $markerEnd
 
     foreach ($cssPath in $cssPaths) {
         Write-Host "Target: $cssPath"
-        $content = Get-Content -LiteralPath $cssPath -Raw
-        $newContent = $content
-
-        foreach ($pair in @(
-            @($markerStart, $markerEnd),
-            @($oldMarkerStart, $oldMarkerEnd),
-            @($safeMarkerStart, $safeMarkerEnd)
-        )) {
-            while ($newContent.Contains($pair[0])) {
-                $pattern = [regex]::Escape($pair[0]) + ".*?" + [regex]::Escape($pair[1]) + "\s*"
-                $newContent = [regex]::Replace(
-                    $newContent,
-                    $pattern,
-                    "",
-                    [System.Text.RegularExpressions.RegexOptions]::Singleline
-                )
-            }
-        }
-
-        $newContent = $newContent.TrimEnd() + $cssBlock + [Environment]::NewLine
-
-        $backup = "$cssPath.bak-$(Get-Date -Format 'yyyyMMdd-HHmmss')"
-        Copy-Item -LiteralPath $cssPath -Destination $backup -Force
-        Write-Utf8NoBom -Path $cssPath -Value $newContent
-        Write-Ok "Patched CSS. Backup: $backup"
-        Update-VSCodeProductChecksum -CssPath $cssPath
+        Set-WorkbenchCss -CssPath $cssPath -CssBlock $cssBlock
     }
 }
 
@@ -819,8 +716,9 @@ function Get-Base64Sha256NoPadding {
     param([string]$Path)
 
     $bytes = [System.IO.File]::ReadAllBytes($Path)
-    $sha = [System.Security.Cryptography.SHA256]::Create().ComputeHash($bytes)
-    return [Convert]::ToBase64String($sha).TrimEnd("=")
+    $sha = [System.Security.Cryptography.SHA256]::Create()
+    try { return [Convert]::ToBase64String($sha.ComputeHash($bytes)).TrimEnd("=") }
+    finally { $sha.Dispose() }
 }
 
 function Set-ObjectProperty {
@@ -836,45 +734,6 @@ function Set-ObjectProperty {
     else {
         Add-Member -InputObject $Object -NotePropertyName $Name -NotePropertyValue $Value
     }
-}
-
-function Update-VSCodeProductChecksum {
-    param([string]$CssPath)
-
-    $needle = [System.IO.Path]::DirectorySeparatorChar + "resources" +
-        [System.IO.Path]::DirectorySeparatorChar + "app" +
-        [System.IO.Path]::DirectorySeparatorChar + "out" +
-        [System.IO.Path]::DirectorySeparatorChar
-
-    $fullCssPath = [System.IO.Path]::GetFullPath($CssPath)
-    $index = $fullCssPath.IndexOf($needle, [System.StringComparison]::OrdinalIgnoreCase)
-    if ($index -lt 0) {
-        Write-WarnLine "Could not derive product.json path for checksum update."
-        return
-    }
-
-    $appRoot = $fullCssPath.Substring(0, $index + $needle.Length - 5)
-    $productPath = Join-Path $appRoot "product.json"
-    if (-not (Test-Path -LiteralPath $productPath)) {
-        Write-WarnLine "product.json was not found for checksum update: $productPath"
-        return
-    }
-
-    $relativeKey = $fullCssPath.Substring($index + $needle.Length).Replace("\", "/")
-    $newChecksum = Get-Base64Sha256NoPadding -Path $fullCssPath
-
-    $product = Get-Content -LiteralPath $productPath -Raw | ConvertFrom-Json
-    if ($null -eq $product.checksums) {
-        Write-WarnLine "product.json does not contain a checksums object."
-        return
-    }
-
-    Set-ObjectProperty -Object $product.checksums -Name $relativeKey -Value $newChecksum
-    $backup = "$productPath.bak-$(Get-Date -Format 'yyyyMMdd-HHmmss')"
-    Copy-Item -LiteralPath $productPath -Destination $backup -Force
-    $productJson = $product | ConvertTo-Json -Depth 100
-    Write-Utf8NoBom -Path $productPath -Value ($productJson + [Environment]::NewLine)
-    Write-Ok "Updated product checksum: $relativeKey"
 }
 
 function New-VSCodeShortcut {
@@ -921,6 +780,7 @@ function Show-Verification {
         try {
             if ($codeCli) {
                 $version = & $codeCli --version
+                if ($LASTEXITCODE -ne 0) { throw 'VS Code CLI version check failed.' }
                 Write-Host "Version:"
                 $version | ForEach-Object { Write-Host "  $_" }
             }
@@ -933,7 +793,7 @@ function Show-Verification {
         }
     }
     else {
-        Write-WarnLine "Code.exe was not found."
+        throw 'Code.exe was not found after setup.'
     }
 
     $settingsPath = Join-Path $env:APPDATA "Code\User\settings.json"
@@ -941,7 +801,7 @@ function Show-Verification {
         $hash = (Get-FileHash -Algorithm SHA256 -LiteralPath $settingsPath).Hash
         Write-Host "settings.json SHA256: $hash"
 
-        $raw = Get-Content -LiteralPath $settingsPath -Raw
+        $raw = Get-Content -LiteralPath $settingsPath -Raw -Encoding UTF8
         foreach ($key in @("editor.fontFamily", "workbench.iconTheme", "workbench.colorTheme")) {
             if ($raw -match ('"' + [regex]::Escape($key) + '"\s*:\s*"([^"]*)"')) {
                 Write-Host "${key}: $($Matches[1])"
@@ -968,40 +828,51 @@ function Show-Verification {
         Write-WarnLine "Extension folder was not found."
     }
 
-    $cssPaths = @(Get-VSCodeWorkbenchCssPaths)
+    $cssPaths = if ($SkipWorkbenchCss) { @() } else { @(Get-VSCodeWorkbenchCssPaths) }
     foreach ($css in $cssPaths) {
-        $hasMarker = (Get-Content -LiteralPath $css -Raw).Contains("vscode-beauty-oneclick")
+        $hasMarker = ([IO.File]::ReadAllText($css)).Contains("vscode-beauty-oneclick")
+        $info = Get-ProductChecksumInfo $css
+        if (-not $hasMarker -or $info.Product.checksums.($info.Key) -ne (Get-Base64Sha256NoPadding $css)) {
+            throw "CSS verification failed: $css"
+        }
         Write-Host "CSS marker: $hasMarker ($css)"
     }
 
-    foreach ($font in @("JetBrains", "HarmonyOS", "Inter")) {
-        $hit = Test-FontRegistry -Name $font
-        if ($hit) {
-            Write-Host "HKCU font registry [$font]: present"
-        }
-        else {
-            Write-WarnLine "HKCU font registry [$font]: not found"
-        }
+}
+
+function Invoke-BeautySetup {
+    Invoke-SetupStep 'Preflight' { $script:SetupPlan = Resolve-SetupPlan }
+    $UserDataPath = $script:SetupPlan.UserData
+    $ExtensionsPath = $script:SetupPlan.Extensions
+    $FontsPath = $script:SetupPlan.Fonts
+    Invoke-SetupStep 'Backup' { Backup-SetupState $script:SetupPlan }
+    Invoke-SetupStep 'Clean' { Clean-StandardVSCodeState } $(if (-not $CleanFirst) { 'Not requested' })
+    Invoke-SetupStep 'VS Code' { Install-VSCode } $(if ($SkipVSCodeInstall) { 'SkipVSCodeInstall' })
+    Invoke-SetupStep 'Fonts' { Install-CurrentUserFonts } $(if ($SkipFonts) { 'SkipFonts' })
+    Invoke-SetupStep 'User data' { Restore-UserData } $(if ($SkipUserData) { 'SkipUserData' } elseif (-not $UserDataPath) { 'No profile supplied or detected' })
+    Invoke-SetupStep 'Extensions' { Restore-Extensions } $(if ($SkipExtensions) { 'SkipExtensions' } elseif (-not $ExtensionsPath) { 'No profile supplied or detected' })
+    $todoRoot = Join-Path $env:USERPROFILE '.vscode\extensions'
+    $todoTree = if (Test-Path -LiteralPath $todoRoot) {
+        Get-ChildItem -LiteralPath $todoRoot -Directory | Where-Object Name -like 'gruntfuggly.todo-tree-*' | Select-Object -First 1
     }
+    Invoke-SetupStep 'Todo Tree' { Configure-TodoTreeRipgrep } $(if (-not $todoTree) { 'Todo Tree is not installed' })
+    Invoke-SetupStep 'Workbench CSS' { Patch-WorkbenchCss } $(if ($SkipWorkbenchCss) { 'SkipWorkbenchCss' })
+    Invoke-SetupStep 'Shortcut' { New-VSCodeShortcut }
+    Invoke-SetupStep 'Verification' { Show-Verification }
 }
-
-Write-Host "VS Code Beauty One-Click" -ForegroundColor Magenta
-Write-Host "Script: $PSCommandPath"
-Write-WarnLine "Fonts are installed for the current user only. HKLM and C:\Windows\Fonts are not modified."
-
-if ($CleanFirst) {
-    Clean-StandardVSCodeState
+# Dot-sourcing exposes functions for isolated tests without running the installer.
+if ($MyInvocation.InvocationName -eq '.') { return }
+Write-Host 'VS Code Beauty One-Click' -ForegroundColor Magenta
+try { Invoke-BeautySetup }
+catch {
+    Show-SetupSummary
+    Write-Host "Failed: $($_.Exception.Message)" -ForegroundColor Red
+    exit 1
 }
-
-Install-VSCode
-$payloadRoot = Get-PayloadRoot
-Install-CurrentUserFonts -PayloadRoot $payloadRoot
-Restore-UserData -PayloadRoot $payloadRoot
-Restore-Extensions -PayloadRoot $payloadRoot
-Configure-TodoTreeRipgrep
-Patch-WorkbenchCss
-New-VSCodeShortcut
-Show-Verification
-
-Write-Host ""
-Write-Ok "Done. Close and reopen VS Code to see the final style."
+Show-SetupSummary
+if ($script:StepWarnings -gt 0) {
+    Write-Host 'Completed with warnings. Review the summary before reopening VS Code.' -ForegroundColor Yellow
+    exit 2
+}
+Write-Ok 'Requested steps completed. Reopen VS Code to see the style.'
+exit 0

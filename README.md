@@ -7,9 +7,9 @@ Windows 上的 VS Code 字体美化与配置迁移脚本。支持安装 VS Code�
 ## 环境与验证范围
 
 - Windows 10/11、VS Code Stable 桌面版。自动下载安装使用 x64 User Installer。
-- 推荐使用 PowerShell 7，在仓库根目录执行下文命令。修改前保存文件并完全退出 VS Code；迁移流程可能强制结束 Code 进程。
+- 推荐使用 PowerShell 7，在仓库根目录执行下文命令。修改前保存文件并完全退出 VS Code；检测到 Code 进程时脚本会停止，不会强制结束进程。
 - 2026-09-12 已在 Windows、PowerShell 7.6.5、VS Code 1.137.0 x64 上完成“已安装后的基础美化”。安装位置为 `D:\Microsoft VS Code`，脚本识别到了该版本的分版本资源子目录。
-- 已核验 41 个字体文件及用户注册项、CSS 校验和、JSON 无 BOM 编码，用户确认基础美化成功。旧 Profile 迁移、重置及其他版本不在本次验证范围内。
+- 已核验 41 个字体文件及用户注册项、CSS 校验和、JSON 无 BOM 编码，用户确认基础美化成功。优化后的脚本另有 PowerShell 7 和 Windows PowerShell 5.1 临时目录回归测试；未在日常电脑上执行实际重置。
 - 默认 User Installer 安装到 `%LOCALAPPDATA%\Programs\Microsoft VS Code`。其他位置是否能识别，取决于脚本对 `code` 命令和候选目录的检测，不保证支持任意自定义目录。
 
 ## 包含多少字体
@@ -32,9 +32,11 @@ JetBrains Mono 和 Inter 使用 SIL Open Font License 1.1；HarmonyOS Sans Fonts
 
 下载或克隆仓库，打开 PowerShell 7，进入包含 `README.md`、`scripts/` 和 `fonts/` 的仓库根目录。
 
-**配置和插件恢复采用镜像复制，会覆盖同名文件，并删除目标中源目录没有的文件。默认恢复不会先备份。** 自动识别和显式指定 Profile 都适用此行为。
+**配置和插件恢复仍采用镜像复制，但现在会先自动备份目标原有内容，备份失败即停止。** 默认备份位置为 `%LOCALAPPDATA%\VSCodeBeauty\Backups\时间戳-随机标识`，也可用 `-BackupPath "E:\VSCodeBackups"` 指定备份父目录。镜像会覆盖同名文件并删除源目录没有的目标文件，自动识别和显式指定 Profile 都适用。
 
-关闭 VS Code 后，可先把当前用户配置和插件复制到仓库之外：
+操作前会检查来源目录、空备份、来源与目标重叠、目录链接、备份位置、参数冲突，以及已有 CSS 标记和校验信息。来源不明确或不完整时直接停止。备份成功后才开始安装、清理和恢复。
+
+如果还想额外保存一份独立备份，关闭 VS Code 后可执行：
 
 ```powershell
 $ErrorActionPreference = 'Stop'
@@ -51,7 +53,7 @@ if (Test-Path -LiteralPath $extensions) {
 Write-Host "Backup: $backupRoot"
 ```
 
-确认复制成功后再继续。这份备份只包含配置和插件；样式修补会在 CSS 和 `product.json` 旁分别生成 `.bak-时间戳` 文件。字体安装会覆盖当前用户字体目录中的同名文件，需要保留已有自定义版本时，应另外备份对应字体文件和注册项。迁移源、备份目录不要放在将被覆盖或清理的目录内。
+上面的手动备份只包含配置和插件。自动备份还保存运行前的 `settings.json`，并在安装字体时保存将被覆盖的用户字体及其注册项到 `fonts/`、`fonts-before.xml`。CSS 与 `product.json` 旁会生成带同一标识的 `.bak-时间戳-随机标识` 文件；修补或校验失败时会尝试一起恢复。迁移源、备份目录不能放在将被覆盖或清理的目录内。
 
 ## 用途一：已安装 VS Code，只做基础美化
 
@@ -110,9 +112,9 @@ E:\VSCodeBeautyProfile\
 
 ### 自动识别与旧格式
 
-不传源路径、也不跳过恢复时，脚本会从脚本目录、仓库目录、仓库父目录、当前工作目录，以及它们的 `profile`、`VSCodeBeautyProfile`、`VSCodeBeautySource`、`payload` 等子目录寻找来源。用户数据和插件分别识别，可能来自不同根目录；首次迁移推荐显式传参。
+不传源路径、也不跳过恢复时，脚本会从脚本目录、仓库目录、仓库父目录、当前工作目录，以及它们的 `profile`、`VSCodeBeautyProfile`、`VSCodeBeautySource`、`payload` 等子目录寻找来源。自动识别只接受同一根目录下成套的数据和插件，不会拼接两份 Profile。
 
-某类来源有多个候选时，脚本打印警告并跳过该类恢复，其他步骤仍继续。最终显示 `Done` 不代表全部迁移成功，应检查中间警告。
+有多个完整候选或只有不完整候选时，会在修改前报错。仅迁移一类内容时，应明确传入它的路径，并用 `-SkipUserData` 或 `-SkipExtensions` 跳过另一类。显式来源不会与自动识别来源混用。完全没有来源且未请求清理时，两项恢复显示为 `Skipped`，继续基础美化。
 
 旧格式仍支持：
 
@@ -141,14 +143,21 @@ E:\VSCodeBeautyProfile\
 | `-SkipUserData` / `-SkipExtensions` | 分别跳过对应镜像恢复 |
 | `-SkipFonts` | 跳过字体安装，其他步骤仍执行 |
 | `-SkipWorkbenchCss` | 跳过 CSS 修补，其他步骤仍执行 |
-| `-CleanFirst` | 先将标准位置的用户数据、插件及用户版安装目录移到桌面备份目录，再继续流程 |
+| `-CleanFirst` | 校验来源后，将标准位置的用户数据、插件及用户版安装目录移到本次备份下的 `cleaned/`，再继续流程 |
+| `-BackupPath` | 指定备份父目录，每次运行创建独立子目录，不覆盖旧备份 |
 | `-ForceDownload` | 强制重新下载安装包并执行安装 |
 
-`-CleanFirst` 不是普通的“备份开关”，也不是基础美化所必需的步骤；它会先清理，再校验后续来源。不要把它与 `-SkipVSCodeInstall` 当作“保留安装只备份”组合使用，也不要让源 Profile 位于待清理目录中。
+`-CleanFirst` 不是普通的“备份开关”，基础美化不需要它。它要求两类来源都有效，且不能与 `-SkipVSCodeInstall`、`-SkipUserData` 或 `-SkipExtensions` 组合；冲突会提前报错。`-ForceDownload` 也不能与 `-SkipVSCodeInstall` 同时使用。
 
-**`Reset-VSCodeBeautyLab.ps1` 仅供可丢弃的测试环境使用，不是日常美化、字体卸载或回滚工具。** 当前实现会尝试卸载 VS Code、移走用户数据和整个 `.vscode` 目录，并尝试清理用户及系统字体目录、HKCU 及 HKLM 字体注册项。管理员运行可能影响其他用户；非管理员运行也会尝试这些操作，失败时仅打印警告。它没有导出字体注册项备份，不能保证完整回滚。
+**`Reset-VSCodeBeautyLab.ps1` 仅供独立测试环境使用，不是日常美化或单独的字体卸载工具。** 现在仅处理标准位置的当前用户版 VS Code、用户数据、`.vscode\extensions` 及匹配的用户字体；不会操作 HKLM、系统字体目录或系统版卸载程序。删除字体前会备份文件和对应 HKCU 注册项；文件删除失败时保留其注册项，并报告警告。
 
-实验前先在独立测试环境创建完整快照，再阅读重置脚本。`Install-FreshVSCodeForLab.ps1` 用于实验环境重新下载安装，不属于日常使用步骤。
+先预览待处理范围，不执行修改：
+
+```powershell
+.\scripts\Reset-VSCodeBeautyLab.ps1 -WhatIf
+```
+
+确认只在测试环境使用后，去掉 `-WhatIf` 执行。重置备份位于 `%LOCALAPPDATA%\VSCodeBeauty\Backups\reset-时间戳-随机标识`。备份不是整机快照，也不保证跨机器恢复登录状态。`Install-FreshVSCodeForLab.ps1` 用于实验环境重新下载安装，不属于日常使用步骤。
 
 ## 验证与恢复
 
@@ -156,5 +165,16 @@ E:\VSCodeBeautyProfile\
 - 检查 CSS 备份路径、`Updated product checksum` 和所有警告，再重启 VS Code。
 - 回退样式时退出 VS Code，将同一次运行、同一 VS Code 版本对应的 CSS 和 `product.json` 备份一起恢复；不要把旧版文件覆盖到更新后的安装目录。
 - 配置和插件恢复方法见 [排错文档](docs/troubleshooting.md)。恢复 CSS 不会卸载已安装字体。
+
+每个步骤分别报告 `Success`、`Skipped`、`Warning` 或 `Failed`。退出码：`0` 表示请求的步骤完成（允许明确跳过），`1` 表示失败并停止，`2` 表示执行结束但有警告需要检查。双击入口也保留这个退出码。
+
+## 回归测试
+
+测试在独立临时目录验证备份、镜像恢复、路径保护、Profile 选择、CSS 回滚及失败报告；字体加载边界使用模拟实现，重置仅执行预览，不操作真实安装或字体注册项。
+
+```powershell
+.\tests\Run-SafetyTests.ps1
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\tests\Run-SafetyTests.ps1
+```
 
 不要将自己的 Profile、登录状态、历史记录或其他私人字体提交到仓库。

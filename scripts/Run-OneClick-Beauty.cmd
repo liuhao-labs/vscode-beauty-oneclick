@@ -10,5 +10,7 @@ if "%~1"=="" (
 ) else (
     powershell.exe -NoProfile -ExecutionPolicy Bypass -File "%~dp0Install-VSCodeBeautyOneClick.ps1" %*
 )
+set "beauty_exit=%errorlevel%"
 echo.
 pause
+exit /b %beauty_exit%

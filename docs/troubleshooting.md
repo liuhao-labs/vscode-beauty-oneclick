@@ -10,7 +10,7 @@ Your Code installation appears to be corrupt. Please reinstall.
 
 原因通常不是 VS Code 真坏了，而是修改了 `workbench.desktop.main.css` 后，没有同步更新 `product.json` 中记录的 SHA256 校验和。
 
-本项目的 `Install-VSCodeBeautyOneClick.ps1` 在修补 CSS 后会重新计算 hash 并写回 `product.json`。这处理的是该 CSS 文件的校验问题，不能保证消除所有安装损坏提示。如果你手动改了 CSS，请使用下文“VS Code 更新后样式消失”中的跳过迁移命令。若日志没有 `Updated product checksum`，先检查安装路径、写入权限和警告；不要只看最终 `Done`。
+本项目的 `Install-VSCodeBeautyOneClick.ps1` 在修补 CSS 后会重新计算 hash 并写回 `product.json`，随后核验两者匹配。这处理的是该 CSS 文件的校验问题，不能保证消除所有安装损坏提示。如果你手动改了 CSS，请使用下文“VS Code 更新后样式消失”中的跳过迁移命令。若日志没有 `Updated product checksum`，检查失败步骤和安装路径；修补失败会尝试恢复本次修改前的 CSS 和校验文件。
 
 需要回退时，退出 VS Code，把同一次运行、同一版本的 CSS 和 `product.json` 备份一起恢复。不要将旧版本的备份覆盖到更新后的安装目录。
 
@@ -89,19 +89,27 @@ VS Code 更新可能替换安装目录中的 workbench CSS。先保存文件、�
 
 ## 配置恢复后，原来的设置或插件不见了
 
-恢复使用 `robocopy /MIR` 镜像复制，源目录没有的目标文件会被删除。默认恢复没有自动备份；运行前应按 [README](../README.md) 复制目标机器的配置和插件。
+恢复仍使用 `robocopy /MIR` 镜像复制，源目录没有的目标文件会被删除。现在默认先自动备份，备份失败不继续。查看汇总中的 `Backup` 路径，默认位于 `%LOCALAPPDATA%\VSCodeBeauty\Backups`。
 
 已有备份时，关闭 VS Code，将当前 `%APPDATA%\Code` 和 `%USERPROFILE%\.vscode\extensions` 分别改名保存，避免丢掉迁移后的新增内容，再把备份中的 `user-data` 和 `extensions` 分别复制回这两个原路径。不要在原目标上直接合并，否则可能留下多余文件。若备份中本来没有某个目录，不要凭空创建“原始备份”。
 
-使用过 `-CleanFirst` 时，检查它输出的桌面备份目录，其中目录名经过路径转换，不是上述手动备份的 `user-data` / `extensions` 命名。没有任何备份时，脚本本身没有撤销镜像删除的功能。
+使用过 `-CleanFirst` 时，查看本次备份目录下的 `cleaned/`，其中目录名经过路径转换，不是常规备份的 `user-data` / `extensions` 命名。旧版脚本的清理备份可能仍在桌面。如果使用旧版镜像恢复且没有任何备份，脚本本身不能撤销已删除的数据。
 
 ## 样式修补一直不结束
 
-当前实现要求旧 CSS 美化块同时有开始和结束标记。若文件只剩开始标记，清理旧块的循环可能无法退出。可中断脚本，确认当前 VS Code 版本后恢复对应的原始 CSS 和 `product.json`，再运行样式修复命令；不要在不完整的 CSS 上反复重试。
+旧版在 CSS 仅剩开始标记时可能无法退出。新版会在修改前检查缺失、嵌套或错序标记，并立即报错，不再循环重试。遇到标记错误时，先确认 VS Code 版本，恢复对应的原始 CSS 和 `product.json`，再运行样式修复命令。
 
 ## 是否需要先运行 Reset
 
-不需要。基础美化和更新后修复都不需要 `Reset-VSCodeBeautyLab.ps1` 或 `-CleanFirst`。当前 Reset 会尝试处理系统字体目录和 HKLM 注册项，也会卸载 VS Code、移走用户配置，只适合独立且有快照的测试环境。
+不需要。基础美化和更新后修复都不需要 `Reset-VSCodeBeautyLab.ps1` 或 `-CleanFirst`。新版 Reset 仅处理当前用户范围，但仍会卸载标准位置的用户版 VS Code 并移走配置、插件，只适合独立测试环境。先使用 `-WhatIf` 查看范围。
+
+## 提示来源不完整、重叠或参数冲突
+
+新版在安装、清理和恢复前进行检查。不要用空目录作为迁移源，不要把源放在目标内，也不要把备份位置设在源或目标内。目录链接和联接不参与镜像复制。只恢复一类内容时必须明确跳过另一类；多个候选不会自动选择。`-CleanFirst` 要求两类有效来源，不能与跳过安装或跳过任一恢复步骤组合。
+
+## 如何判断执行是否成功
+
+查看步骤表：`Success` 为完成，`Skipped` 为跳过，`Warning` 为完成但有需要处理的问题，`Failed` 为失败并停止。退出码分别是 `0`（完成，允许跳过）、`1`（失败）、`2`（有警告）。失败并不代表之前所有步骤都自动撤销；配置、插件和字体可从已输出的备份位置恢复，CSS 写入失败会尝试恢复该对文件。
 
 ## 私人 Profile 不要提交到 Git
 

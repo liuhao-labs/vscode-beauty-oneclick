@@ -7,7 +7,7 @@
 - 调用 GDI 的 `AddFontResourceW`
 - 通过 `WM_FONTCHANGE` 通知正在运行的应用刷新字体列表
 
-以上描述的是主安装脚本 `Install-VSCodeBeautyOneClick.ps1`，它不写入 `C:\Windows\Fonts` 或 HKLM。实验重置脚本的处理范围不同，见下文。
+主安装脚本和实验重置脚本都只处理当前用户字体，不写入 `C:\Windows\Fonts` 或 HKLM。
 
 ## 数量与用途
 
@@ -28,7 +28,7 @@
 5. 调用 `AddFontResourceW`
 6. 广播 `WM_FONTCHANGE`
 
-脚本的安装计数不验证 `AddFontResourceW` 的返回值；看到数量成功后，还应检查实际显示效果。需要保留已安装的自定义同名字体版本时，应先备份对应文件和注册项。
+现在会检查 `AddFontResourceW` 的返回值、字体文件哈希和注册路径，任一失败就停止并报告失败。相同内容的字体文件不重复覆盖；安装前自动备份已有同名文件和注册项到本次备份目录的 `fonts/`、`fonts-before.xml`。系统加载成功后，仍应在应用中检查实际显示效果。
 
 ## 检查是否遗漏
 
@@ -59,7 +59,9 @@ Write-Host "Repository font files: $($fonts.Count)"
 
 仅想移除字体时，应通过 Windows 字体设置确认并卸载所需字体，不要使用实验重置脚本作为字体卸载工具。
 
-当前 `Reset-VSCodeBeautyLab.ps1` 会尝试处理用户字体目录和 `C:\Windows\Fonts`，以及 HKCU 和 HKLM 字体注册项。文件按来源文件名匹配，注册项还会按内置字体系列名称匹配，可能涉及之前已安装的同系列字体。文件删除前尝试备份，但注册项没有导出备份；管理员运行可能影响其他用户。它还会卸载 VS Code 并移走配置，只适合可丢弃、有快照的测试环境。
+`Reset-VSCodeBeautyLab.ps1` 仅处理当前用户字体目录和 HKCU 注册项，不操作系统字体或 HKLM。按清单中的精确文件名和用户字体路径匹配，不再仅凭系列名称删除。它会先备份匹配字体及注册值到 `fonts-before/`、`fonts-registry-before.xml`；文件删除失败时保留注册项，汇总为警告。XML 备份保存值名称、类型和原值，用于人工核对恢复，不是可双击导入的 `.reg` 文件。
+
+重置还会卸载标准位置的用户版 VS Code、移走配置和插件，只适合独立测试环境。可使用 `-WhatIf` 先预览范围。安装与重置都不强制关闭正在运行的 VS Code。
 
 ## 官方依据
 
